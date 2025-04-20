@@ -1,5 +1,6 @@
 venv
 .pls
+.clang-format
 
 # For `pls build`.
 C5T
