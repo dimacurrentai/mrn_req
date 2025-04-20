@@ -13,8 +13,8 @@ using CHUNKED_T =
     current::net::HTTPServerConnection::ChunkedResponseSender<CURRENT_BRICKS_HTTP_DEFAULT_CHUNK_CACHE_SIZE>;
 
 struct TaskStepResponse {
-  int64_t next_dt = 0;                // Set to nonzero to be `.Advance()`-d later on, or zero to be stopped.
-  std::function<void()> side_effect;  // Set to be executed by the LEADER, and swallowed silently by the followers.
+  int64_t next_dt = 0;                   // Set to nonzero to be `.Advance()`-d later on, or zero to be stopped.
+  std::function<void(int)> side_effect;  // Set to be executed by the LEADER, and swallowed silently by the followers.
 };
 
 struct ExecutableTaskTrait {
@@ -36,13 +36,16 @@ struct DivisorsStateMachine final : ExecutableTaskTrait {
   TaskStepResponse Advance() override {
     while (i > 0) {
       if ((n % i) == 0) {
-        auto const s = current::strings::Printf("RESPONSE|local|A divisor of %d is %d.\n", n, i);
-        return {(i--) * 10'000, [this, s]() { c(s); }};
+        auto save_i = i;
+        return {(i--) * 10'000, [this, save_i](int executor) {
+                  c(current::strings::Printf("RESPONSE|executor=%d|A divisor of %d is %d.\n", executor, n, save_i));
+                }};
       } else {
         i--;
       }
     }
-    return {0, [this]() { c(current::strings::Printf("RESPONSE|local|Done for %d!\n", n)); }};
+    return {0,
+            [this](int executor) { c(current::strings::Printf("RESPONSE|executor=%d|Done for %d!\n", executor, n)); }};
   }
 };
 
@@ -63,8 +66,8 @@ struct Worker {
   HTTPRoutesScope scope;
   current::WaitableAtomic<NodeState> waitable_node_state;
   std::thread worker_thread;
-  Worker(int n, uint16_t port)
-      : worker_thread([this]() {
+  Worker(int executor_index, uint16_t port)
+      : worker_thread([this, executor_index]() {
           std::chrono::microseconds const WAIT_SKIP(1);
           std::chrono::microseconds const WAIT_FOREVER(1'000'000'000'000);
           std::chrono::microseconds wait_duration(WAIT_FOREVER);
@@ -98,7 +101,7 @@ struct Worker {
               TaskStepResponse response = pair.second->Advance();
               int64_t const next_dt = response.next_dt;
               if (response.side_effect) {
-                response.side_effect();
+                response.side_effect(executor_index);
               }
               // Re-insert it back to the list of tasks to run, if needed.
               // Otherwise it will be destroyed as this scope ends, right after the next `if`,
