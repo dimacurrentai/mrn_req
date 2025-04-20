@@ -1,2 +1,10 @@
 venv
 .pls
+
+# For `pls build`.
+C5T
+current
+.debug
+.release
+.vscode
+CMakeLists.txt
