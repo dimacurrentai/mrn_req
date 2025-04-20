@@ -12,12 +12,17 @@ DEFINE_uint16(n_executors, 3, "The number of executors (threads, simulated worke
 using CHUNKED_T =
     current::net::HTTPServerConnection::ChunkedResponseSender<CURRENT_BRICKS_HTTP_DEFAULT_CHUNK_CACHE_SIZE>;
 
+struct TaskStepResponse {
+  int64_t next_dt = 0;                // Set to nonzero to be `.Advance()`-d later on, or zero to be stopped.
+  std::function<void()> side_effect;  // Set to be executed by the LEADER, and swallowed silently by the followers.
+};
+
 struct ExecutableTaskTrait {
   virtual ~ExecutableTaskTrait() {}
 
   // Return a zero and your executable task is destroyed right afterwards.
   // Return a positive value and your `.Advance()` is called in this number of microseconds.
-  virtual int64_t Advance() = 0;
+  virtual TaskStepResponse Advance() = 0;
 };
 
 struct DivisorsStateMachine final : ExecutableTaskTrait {
@@ -28,17 +33,16 @@ struct DivisorsStateMachine final : ExecutableTaskTrait {
   explicit DivisorsStateMachine(Request r, CHUNKED_T c, int n) : r(std::move(r)), c(std::move(c)), n(n), i(n) {}
 
   // The state machine implemented explicly, compare to its implicit logic with `sleep_for()` in the previous commit.
-  int64_t Advance() override {
+  TaskStepResponse Advance() override {
     while (i > 0) {
       if ((n % i) == 0) {
-        c(current::strings::Printf("RESPONSE|local|A divisor of %d is %d.\n", n, i));
-        return (i--) * 10'000;
+        auto const s = current::strings::Printf("RESPONSE|local|A divisor of %d is %d.\n", n, i);
+        return {(i--) * 10'000, [this, s]() { c(s); }};
       } else {
         i--;
       }
     }
-    c(current::strings::Printf("RESPONSE|local|Done for %d!\n", n));
-    return 0;
+    return {0, [this]() { c(current::strings::Printf("RESPONSE|local|Done for %d!\n", n)); }};
   }
 };
 
@@ -91,7 +95,11 @@ struct Worker {
                 wait_duration);
             if (pair.second) {
               // There's a task to run.
-              int64_t const next_dt = pair.second->Advance();
+              TaskStepResponse response = pair.second->Advance();
+              int64_t const next_dt = response.next_dt;
+              if (response.side_effect) {
+                response.side_effect();
+              }
               // Re-insert it back to the list of tasks to run, if needed.
               // Otherwise it will be destroyed as this scope ends, right after the next `if`,
               // thus closing the connection.
