@@ -6,7 +6,8 @@ PLS_INCLUDE_HEADER_ONLY_CURRENT();
 #include "blocks/http/api.h"
 #include "bricks/sync/waitable_atomic.h"
 
-DEFINE_uint16(port, 7001, "The port to run on.");
+DEFINE_uint16(base_port, 7001, "The port to run on, will use this and a few more after it.");
+DEFINE_uint16(n_executors, 3, "The number of executors (threads, simulated workers) to spawn.");
 
 using CHUNKED_T =
     current::net::HTTPServerConnection::ChunkedResponseSender<CURRENT_BRICKS_HTTP_DEFAULT_CHUNK_CACHE_SIZE>;
@@ -54,77 +55,91 @@ struct NodeState final {
   }
 };
 
-int main() {
+struct Worker {
+  HTTPRoutesScope scope;
   current::WaitableAtomic<NodeState> waitable_node_state;
-  std::thread node_executor([&waitable_node_state]() {
-    std::chrono::microseconds const WAIT_SKIP(1);
-    std::chrono::microseconds const WAIT_FOREVER(1'000'000'000'000);
-    std::chrono::microseconds wait_duration(WAIT_FOREVER);
-    while (true) {
-      using PAIR_T = std::pair<std::chrono::microseconds, std::unique_ptr<ExecutableTaskTrait>>;
-      bool const waiting_forever = wait_duration == WAIT_FOREVER;
-      PAIR_T pair = waitable_node_state.WaitFor(
-          [waiting_forever](NodeState const& node_state) {
-            if (waiting_forever) {
-              return !node_state.pqueue.empty();
+  std::thread worker_thread;
+  Worker(int n, uint16_t port)
+      : worker_thread([this]() {
+          std::chrono::microseconds const WAIT_SKIP(1);
+          std::chrono::microseconds const WAIT_FOREVER(1'000'000'000'000);
+          std::chrono::microseconds wait_duration(WAIT_FOREVER);
+          while (true) {
+            using PAIR_T = std::pair<std::chrono::microseconds, std::unique_ptr<ExecutableTaskTrait>>;
+            bool const waiting_forever = wait_duration == WAIT_FOREVER;
+            PAIR_T pair = waitable_node_state.WaitFor(
+                [waiting_forever](NodeState const& node_state) {
+                  if (waiting_forever) {
+                    return !node_state.pqueue.empty();
+                  } else {
+                    return !node_state.pqueue.empty() && node_state.pqueue.begin()->first < current::time::Now();
+                  }
+                },
+                [](NodeState& node_state) -> PAIR_T {
+                  if (!node_state.pqueue.empty() && node_state.pqueue.begin()->first < current::time::Now()) {
+                    // If there is a task and its time has come, then execute its `.Advance()`.
+                    PAIR_T result = std::move(*node_state.pqueue.begin());
+                    node_state.pqueue.erase(node_state.pqueue.begin());
+                    return result;
+                  } else if (!node_state.pqueue.empty()) {
+                    // If there is a task but its time has not come, note when its time does come.
+                    return {node_state.pqueue.begin()->first, nullptr};
+                  } else {
+                    return PAIR_T();
+                  }
+                },
+                wait_duration);
+            if (pair.second) {
+              // There's a task to run.
+              int64_t const next_dt = pair.second->Advance();
+              // Re-insert it back to the list of tasks to run, if needed.
+              // Otherwise it will be destroyed as this scope ends, right after the next `if`,
+              // thus closing the connection.
+              if (next_dt) {
+                std::chrono::microseconds next_ts = pair.first + std::chrono::microseconds(next_dt);
+                waitable_node_state.MutableUse(
+                    [next_ts, &pair](NodeState& node_state) { node_state.PushTask(next_ts, std::move(pair.second)); });
+              }
+              // If we executed something, no need to wait for the next cycle,
+              // since we do not know when the next task is.
+              wait_duration = WAIT_SKIP;
             } else {
-              return !node_state.pqueue.empty() && node_state.pqueue.begin()->first < current::time::Now();
+              // If no tasks emerged during the wait period, `pair.first` would be `microseconds(0)`.
+              // In this case, we need to wait until new tasks emerge.
+              wait_duration = WAIT_FOREVER;
             }
-          },
-          [](NodeState& node_state) -> PAIR_T {
-            if (!node_state.pqueue.empty() && node_state.pqueue.begin()->first < current::time::Now()) {
-              // If there is a task and its time has come, then execute its `.Advance()`.
-              PAIR_T result = std::move(*node_state.pqueue.begin());
-              node_state.pqueue.erase(node_state.pqueue.begin());
-              return result;
-            } else if (!node_state.pqueue.empty()) {
-              // If there is a task but its time has not come, note when its time does come.
-              return {node_state.pqueue.begin()->first, nullptr};
-            } else {
-              return PAIR_T();
-            }
-          },
-          wait_duration);
-      if (pair.second) {
-        // There's a task to run.
-        int64_t const next_dt = pair.second->Advance();
-        // Re-insert it back to the list of tasks to run, if needed.
-        // Otherwise it will be destroyed as this scope ends, right after the next `if`, thus closing the connection.
-        if (next_dt) {
-          std::chrono::microseconds next_ts = pair.first + std::chrono::microseconds(next_dt);
-          waitable_node_state.MutableUse(
-              [next_ts, &pair](NodeState& node_state) { node_state.PushTask(next_ts, std::move(pair.second)); });
-        }
-        // If we executed something, no need to wait for the next cycle, since we do not know when the next task is.
-        wait_duration = WAIT_SKIP;
+          }
+        }) {
+    auto& server = HTTP(current::net::BarePort(port));
+    auto ok = [](Request r) { r("OK, try /100\n"); };
+    scope += server.Register("/", ok);
+    scope += server.Register("/ok", ok);
+    scope += server.Register("/status", ok);
+    scope += server.Register("/", URLPathArgs::CountMask::One, [this](Request r) {
+      int n;
+      if (!(std::istringstream(r.url_path_args[0]) >> n)) {
+        r("Need a number as a URL path arg.\n");
+      } else if (!(n >= 1 && n <= 1000)) {
+        r("Need a number between 1 and 1000 as a URL path arg.\n");
       } else {
-        // If no tasks emerged during the wait period, `pair.first` would be `microseconds(0)`.
-        // In this case, we need to wait until new tasks emerge.
-        wait_duration = WAIT_FOREVER;
+        auto now = current::time::Now();
+        CHUNKED_T c = r.SendChunkedResponse();
+        auto task = std::make_unique<DivisorsStateMachine>(std::move(r), std::move(c), n);
+        waitable_node_state.MutableUse(
+            [n, now, &task](NodeState& node_state) { node_state.PushTask(now, std::move(task)); });
       }
-    }
-  });
+    });
+  }
 
-  auto& server = HTTP(current::net::BarePort(FLAGS_port));
-  auto ok = [](Request r) { r("OK, try /100\n"); };
-  auto scope = server.Register("/", ok);
-  scope += server.Register("/ok", ok);
-  scope += server.Register("/status", ok);
-  scope += server.Register("/", URLPathArgs::CountMask::One, [&waitable_node_state](Request r) {
-    int n;
-    if (!(std::istringstream(r.url_path_args[0]) >> n)) {
-      r("Need a number as a URL path arg.\n");
-    } else if (!(n >= 1 && n <= 1000)) {
-      r("Need a number between 1 and 1000 as a URL path arg.\n");
-    } else {
-      auto now = current::time::Now();
-      CHUNKED_T c = r.SendChunkedResponse();
-      auto task = std::make_unique<DivisorsStateMachine>(std::move(r), std::move(c), n);
-      waitable_node_state.MutableUse(
-          [n, now, &task](NodeState& node_state) { node_state.PushTask(now, std::move(task)); });
-    }
-  });
-  server.Join();
+  ~Worker() {
+    // NOTE(dkorolev): This does not `.Join()` the HTTP server, but it's fine, it'll run until Ctrl+C regardless.
+    worker_thread.join();
+  }
+};
 
-  node_executor.join();
+int main() {
+  std::vector<std::unique_ptr<Worker>> workers;
+  for (uint16_t i = 0; i < FLAGS_n_executors; ++i) {
+    workers.push_back(std::make_unique<Worker>(int(i), FLAGS_base_port + i));
+  }
 }
